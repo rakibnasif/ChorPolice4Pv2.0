@@ -523,6 +523,7 @@
 <body>
   <!-- other players' voices play here (hidden) -->
   <div id="audioBox" style="position:absolute;width:0;height:0;overflow:hidden"></div>
+  <div id="audioHint" style="display:none;position:fixed;left:12px;right:12px;bottom:12px;z-index:50;cursor:pointer;text-align:center;background:#e0356f;color:#fff;border-radius:14px;padding:12px;font-weight:bold">🔊 Onno der kotha shunte ekbar ekhane tap koro</div>
   <div class="container">
 
     <!-- Screen 1: your name, create a room or join one -->
@@ -665,14 +666,14 @@
     var localNotice = "";                       // my own "reconnecting" message
 
     // ===== Voice chat data =====
-    var myVoiceOn = false;                      // did I join the voice chat?
-    var myMuted = false;                        // is my mic muted?
+    var micStream = null;                       // my real microphone (after I press Mic)
+    var micOn = false;                          // is my mic open and unmuted?
+    var silentStream = null;                    // silent sound, used until my mic is on
+    var voiceCalls = {};                        // voice call with each phone (key = peer id)
     var speakerOn = true;                       // do I hear the others? (only on my phone)
-    var localStream = null;                     // my microphone
-    var voiceCalls = [null, null, null, null];  // voice call with each player
-    var speaking = [false, false, false, false];// who is talking right now
-    var audioCtx = null;                        // used to detect who is talking
-    var analysers = [null, null, null, null];   // one per player
+    var speaking = [false, false, false, false];// who is talking right now (by seat)
+    var audioCtx = null;                        // makes the silence + detects who is talking
+    var analysers = {};                         // "me" or peer id -> volume meter
 
     // ===== Screen data =====
     var lastView = null;     // last thing the host sent me
@@ -842,12 +843,8 @@
         clearTimeout(awayTimers[i]);
         awayTimers[i] = null;
         guestConns[i] = null;
-        if (voiceCalls[i]) {
-          try { voiceCalls[i].call.close(); } catch (e) { }
-          voiceCalls[i] = null;
-          removeRemote(i);
-        }
       }
+      closeAllCalls();
       var old = peer;
       peer = null;
       hostConn = null;
@@ -894,7 +891,6 @@
         game = saved.game;
         if (!game.tokens) game.tokens = ["", "", "", ""];
         game.away = [false, false, false, false];
-        game.voiceOn = [false, false, false, false]; // everybody joins voice again
         openRoom(0, roomCode);
       } else {
         isHost = false;
@@ -933,9 +929,10 @@
       leaving = true;
       stopRetry = true;
       clearSession();
-      if (localStream) {
-        localStream.getTracks().forEach(function (t) { t.stop(); });
+      if (micStream) {
+        micStream.getTracks().forEach(function (t) { t.stop(); });
       }
+      closeAllCalls();
       try { if (peer) peer.destroy(); } catch (e) { }
       location.reload();
     }
@@ -1097,7 +1094,6 @@
         names: ["", "", "", ""],      // player names, "" = empty seat
         tokens: ["", "", "", ""],     // secret id of each player (to give the seat back)
         away: [false, false, false, false], // true = player lost connection
-        voiceOn: [false, false, false, false], // true = player joined the voice chat
         totals: [0, 0, 0, 0],         // total score of each player
         rows: [],                     // one entry per finished round
         roles: [],                    // roles[i] = role of player i
@@ -1147,7 +1143,6 @@
     function markAway(i) {
       guestConns[i] = null;
       game.away[i] = true;
-      game.voiceOn[i] = false;
       clearTimeout(awayTimers[i]);
       if (game.phase == "lobby") {
         // in the lobby the seat is freed if he does not come back
@@ -1369,10 +1364,6 @@
         setLocalNotice("");
         render(msg.view);
         saveSession();
-        // host forgot that I am in voice (host refreshed / I reconnected): tell him again
-        if (myVoiceOn && msg.view.voiceOn && !msg.view.voiceOn[msg.view.myIndex]) {
-          sendToHost({ type: "voice", on: true });
-        }
       }
       if (msg.type == "rejected") {
         giveUp(msg.reason);
@@ -1385,14 +1376,6 @@
 
     // every player sends actions here. p = player number (0 to 3)
     function handleMessage(p, msg) {
-      // a player joined the voice chat
-      if (msg.type == "voice") {
-        if (!game.voiceOn) game.voiceOn = [false, false, false, false];
-        game.voiceOn[p] = !!msg.on;
-        sendAll();
-        return;
-      }
-
       // host starts the game from the lobby
       if (msg.type == "start" && p == 0 && game.phase == "lobby") {
         var seats = 0;
@@ -1511,7 +1494,7 @@
       var voiceIds = ["cpbd-" + roomCode, "", "", ""];
       for (var v = 1; v < 4; v++) {
         if (guestConns[v] && guestConns[v].open) {
-          voiceIds[v] = guestConns[v].peer;
+          voiceIds[v] = guestConns[v].peer;   // everybody who is connected is in the voice chat
         }
       }
 
@@ -1521,7 +1504,6 @@
         myIndex: p,
         names: game.names.slice(),
         away: game.away.slice(),
-        voiceOn: (game.voiceOn || [false, false, false, false]).slice(),
         voiceIds: voiceIds,
         totals: game.totals.slice(),
         rows: game.rows,
@@ -1975,33 +1957,69 @@
     }
 
     // =====================================================
-    //  PART 5: VOICE CHAT (everyone talks to everyone)
-    //  - Press the Voice button once to turn the mic on.
-    //  - The phones then call each other directly (PeerJS media call).
+    //  PART 5: VOICE CHAT (everyone can talk to everyone)
+    //  - As soon as you are in the room, your phone joins the voice
+    //    mesh on its own and LISTENS to the others (no button needed).
+    //  - Until you press "Mic", you send silence.
+    //  - Pressing "Mic" asks for the microphone once. After that the
+    //    same button turns your mic on / off (calls are NOT restarted,
+    //    only the sound inside them is swapped, so it is instant).
+    //  - "Speaker" only changes what YOU hear.
     //  - To avoid two calls between the same 2 phones, the player with
     //    the SMALLER seat number always makes the call.
-    //  - The host tells everybody who is in voice and each phone's id
-    //    (view.voiceOn and view.voiceIds), so nothing else is needed.
+    //  - The host sends everyone the phone id of every connected
+    //    player (view.voiceIds), so every phone knows who to call.
+    //  - Every 3 seconds each phone checks all calls and repairs
+    //    the broken ones.
     // =====================================================
 
-    // text and colour of the voice buttons
+    // make the audio engine and a silent sound (works without permission)
+    function initAudio() {
+      try {
+        if (!audioCtx) {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (!silentStream) {
+          silentStream = audioCtx.createMediaStreamDestination().stream;
+        }
+      } catch (e) { }
+    }
+
+    // the sound I send right now: real mic if it is on, otherwise silence
+    function getOutStream() {
+      initAudio();
+      if (micStream) return micStream;
+      return silentStream;
+    }
+
+    // put my current sound into every running call (no new call needed)
+    function pushTrackToCalls() {
+      var out = getOutStream();
+      var track = out ? out.getAudioTracks()[0] : null;
+      if (!track) return;
+      for (var id in voiceCalls) {
+        var pc = voiceCalls[id].call.peerConnection;
+        if (!pc) continue;
+        pc.getSenders().forEach(function (sender) {
+          if (sender.track && sender.track.kind == "audio" && sender.track !== track) {
+            sender.replaceTrack(track).catch(function () { });
+          }
+        });
+      }
+    }
+
     function updateVoiceButtons() {
       var ids = ["voiceBtn", "voiceBtn2"];
       for (var i = 0; i < ids.length; i++) {
         var btn = getEl(ids[i]);
-        if (!myVoiceOn) {
-          btn.textContent = "🎤 Voice";
-          btn.className = "btn btn-outline btn-voice";
-        } else if (myMuted) {
-          btn.textContent = "🔇 Mic Off";
-          btn.className = "btn btn-outline btn-voice muted";
-        } else {
+        if (micOn) {
           btn.textContent = "🎙️ Mic On";
           btn.className = "btn btn-outline btn-voice on";
+        } else {
+          btn.textContent = "🎤 Mic Off";
+          btn.className = "btn btn-outline btn-voice muted";
         }
       }
-
-      // speaker buttons (only changes what I hear, others are not affected)
       var spk = ["spkBtn", "spkBtn2"];
       for (var s = 0; s < spk.length; s++) {
         var sb = getEl(spk[s]);
@@ -2015,74 +2033,121 @@
       }
     }
 
-    // speaker on / off: only for this phone
-    function toggleSpeaker() {
-      speakerOn = !speakerOn;
-      for (var i = 0; i < 4; i++) {
-        var el = getEl("aud" + i);
-        if (el) {
-          el.muted = !speakerOn;
-          if (speakerOn) el.play().catch(function () { });
-        }
-      }
-      updateVoiceButtons();
-    }
-
-    // 1st press: mic on. After that: mute / unmute.
-    function toggleVoice() {
-      if (!myVoiceOn) {
-        startVoice();
+    // Mic button: 1st press asks permission, then it is on / off
+    function toggleMic() {
+      unlockAudio();
+      if (!micStream) {
+        startMic();
         return;
       }
-      myMuted = !myMuted;
-      if (localStream) {
-        localStream.getAudioTracks().forEach(function (t) {
-          t.enabled = !myMuted;
-        });
-      }
+      micOn = !micOn;
+      micStream.getAudioTracks().forEach(function (t) {
+        t.enabled = micOn;
+      });
       updateVoiceButtons();
     }
 
-    function startVoice() {
+    function startMic() {
       if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        alert("Voice er jonno game ta https:// link e kholte hobe. Ei link e mic kaj korbe na.");
+        alert("Mic er jonno game ta https:// link e kholte hobe. Ei link e mic kaj korbe na.");
         return;
       }
       navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         video: false
       }).then(function (stream) {
-        localStream = stream;
-        myVoiceOn = true;
-        myMuted = false;
-        prepareAudioContext();
-        if (lastView) {
-          watchSpeaking(lastView.myIndex, stream);
-        }
+        micStream = stream;
+        micOn = true;
+        stream.getAudioTracks().forEach(function (t) {
+          t.enabled = true;
+          // phone took the mic away (call, other app): show it as off
+          t.onended = function () {
+            if (micStream === stream) {
+              micStream = null;
+              micOn = false;
+              analysers["me"] = null;
+              pushTrackToCalls();
+              updateVoiceButtons();
+            }
+          };
+        });
+        pushTrackToCalls();
+        watchSpeaking("me", stream);
         updateVoiceButtons();
-        // the tap that turned the mic on also allows the other players' sound to play
-        for (var i = 0; i < 4; i++) {
-          var el = getEl("aud" + i);
-          if (el) el.play().catch(function () { });
-        }
-        sendToHost({ type: "voice", on: true });
       }).catch(function () {
         alert("Mic permission paoa jayni. Browser er settings e giye mic allow koro.");
       });
     }
 
-    function prepareAudioContext() {
+    // speaker on / off: only for this phone
+    function toggleSpeaker() {
+      speakerOn = !speakerOn;
+      var list = getEl("audioBox").getElementsByTagName("audio");
+      for (var i = 0; i < list.length; i++) {
+        list[i].muted = !speakerOn;
+      }
+      unlockAudio();
+      updateVoiceButtons();
+    }
+
+    // ----- sound playing (browsers block sound until the user taps) -----
+    function showAudioHint(on) {
+      getEl("audioHint").style.display = on ? "block" : "none";
+    }
+
+    function playAll() {
+      var list = getEl("audioBox").getElementsByTagName("audio");
+      var blocked = false;
+      var left = list.length;
+      for (var i = 0; i < list.length; i++) {
+        (function (el) {
+          var r = el.play();
+          if (r && r.catch) {
+            r.catch(function () {
+              blocked = true;
+              showAudioHint(true);
+            });
+          }
+        })(list[i]);
+      }
+      return blocked;
+    }
+
+    // called on every tap: lets the browser play the others' voices
+    function unlockAudio() {
+      initAudio();
       try {
-        if (!audioCtx) {
-          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        }
-        if (audioCtx.state == "suspended") {
+        if (audioCtx && audioCtx.state == "suspended") {
           audioCtx.resume();
         }
       } catch (e) { }
+      var list = getEl("audioBox").getElementsByTagName("audio");
+      if (list.length == 0) {
+        showAudioHint(false);
+        return;
+      }
+      var ok = 0;
+      var done = 0;
+      for (var i = 0; i < list.length; i++) {
+        var r = list[i].play();
+        if (r && r.then) {
+          r.then(function () {
+            ok++;
+            done++;
+            if (done == list.length) showAudioHint(ok < list.length);
+          }).catch(function () {
+            done++;
+            if (done == list.length) showAudioHint(ok < list.length);
+          });
+        } else {
+          done++;
+          ok++;
+        }
+      }
     }
 
-    // who is calling me? (find the seat from the phone id)
+    // ----- calls -----
+    // seat number of a phone id (-1 if we don't know it yet)
     function seatOfPeer(id) {
       if (!lastView || !lastView.voiceIds) return -1;
       for (var i = 0; i < 4; i++) {
@@ -2091,45 +2156,52 @@
       return -1;
     }
 
+    // someone calls me: always answer (we listen even if our mic is off)
     function onIncomingCall(call) {
-      var j = seatOfPeer(call.peer);
-      if (!myVoiceOn || !localStream || j < 0) {
+      var out = getOutStream();
+      if (!out) {
         try { call.close(); } catch (e) { }
-        return; // not in voice yet, the caller will try again later
+        return;
       }
-      call.answer(localStream);
-      attachCall(j, call);
+      call.answer(out);
+      attachCall(call);
     }
 
     // remember a call and play its sound
-    function attachCall(j, call) {
-      var old = voiceCalls[j];
+    function attachCall(call) {
+      var id = call.peer;
+      var old = voiceCalls[id];
       if (old && old.call !== call) {
         try { old.call.close(); } catch (e) { }
       }
-      var entry = { call: call, id: call.peer, born: Date.now(), got: false };
-      voiceCalls[j] = entry;
+      var entry = { call: call, id: id, born: Date.now(), got: false, badSince: 0 };
+      voiceCalls[id] = entry;
 
       call.on("stream", function (stream) {
-        if (voiceCalls[j] !== entry) return;
+        if (voiceCalls[id] !== entry) return;
         entry.got = true;
-        playRemote(j, stream);
+        playRemote(id, stream);
       });
       function ended() {
-        if (voiceCalls[j] === entry) {
-          voiceCalls[j] = null;
-          removeRemote(j);
+        if (voiceCalls[id] === entry) {
+          delete voiceCalls[id];
+          removeRemote(id);
         }
       }
       call.on("close", ended);
       call.on("error", ended);
     }
 
-    function playRemote(j, stream) {
-      var el = getEl("aud" + j);
+    function audioIdOf(id) {
+      return "aud-" + id.replace(/[^a-zA-Z0-9_-]/g, "_");
+    }
+
+    function playRemote(id, stream) {
+      var elId = audioIdOf(id);
+      var el = getEl(elId);
       if (!el) {
         el = document.createElement("audio");
-        el.id = "aud" + j;
+        el.id = elId;
         el.autoplay = true;
         el.setAttribute("playsinline", "");
         getEl("audioBox").appendChild(el);
@@ -2138,92 +2210,118 @@
         el.srcObject = stream;
       }
       el.muted = !speakerOn;
-      el.play().catch(function () { });
-      watchSpeaking(j, stream);
+      var r = el.play();
+      if (r && r.catch) {
+        r.catch(function () {
+          showAudioHint(true);   // browser blocked the sound, ask for one tap
+        });
+      }
+      watchSpeaking(id, stream);
     }
 
-    function removeRemote(j) {
-      var el = getEl("aud" + j);
+    function removeRemote(id) {
+      var el = getEl(audioIdOf(id));
       if (el) {
         el.srcObject = null;
         el.remove();
       }
-      unwatchSpeaking(j);
+      unwatchSpeaking(id);
     }
 
-    // make sure every call that should exist exists (and dead ones are removed)
+    function closeCall(id) {
+      var entry = voiceCalls[id];
+      if (entry) {
+        try { entry.call.close(); } catch (e) { }
+        delete voiceCalls[id];
+      }
+      removeRemote(id);
+    }
+
+    function closeAllCalls() {
+      for (var id in voiceCalls) {
+        closeCall(id);
+      }
+    }
+
+    // make sure every call that should exist exists, and broken ones are replaced
     function syncVoice(view) {
-      if (!view || !view.voiceOn || !view.voiceIds) return;
+      if (!view || !view.voiceIds || !peer || !peer.open) return;
       var me = view.myIndex;
+      initAudio();
+      var out = getOutStream();
+      if (!out) return;
+
+      // who should I be connected to
+      var want = {};
       for (var j = 0; j < 4; j++) {
-        if (j == me) continue;
-        var cur = voiceCalls[j];
-        var want = myVoiceOn && localStream && view.voiceOn[j] && view.voiceIds[j] != "";
-
-        // dead call? remove it so it can be made again
-        if (cur) {
-          var pc = cur.call.peerConnection;
-          var state = pc ? pc.iceConnectionState : "";
-          var stuck = !cur.got && Date.now() - cur.born > 20000;
-          if (state == "failed" || state == "closed" || stuck) {
-            try { cur.call.close(); } catch (e) { }
-            voiceCalls[j] = null;
-            removeRemote(j);
-            cur = null;
-          }
+        if (j != me && view.voiceIds[j] != "" && !view.away[j]) {
+          want[view.voiceIds[j]] = j;
         }
+      }
 
-        if (!want) {
-          if (cur) {
-            try { cur.call.close(); } catch (e) { }
-            voiceCalls[j] = null;
-            removeRemote(j);
-          }
+      // check the calls I have
+      for (var id in voiceCalls) {
+        if (want[id] === undefined) {
+          closeCall(id); // that phone is gone or has a new id
           continue;
         }
-
-        // the other phone got a new id (it reconnected): drop the old call
-        if (cur && cur.id != view.voiceIds[j]) {
-          try { cur.call.close(); } catch (e) { }
-          voiceCalls[j] = null;
-          removeRemote(j);
-          cur = null;
+        var entry = voiceCalls[id];
+        var pc = entry.call.peerConnection;
+        var state = pc ? pc.iceConnectionState : "";
+        var now = Date.now();
+        var dead = false;
+        if (state == "failed" || state == "closed") {
+          dead = true;
+        } else if (state == "disconnected") {
+          if (entry.badSince == 0) entry.badSince = now;
+          if (now - entry.badSince > 8000) dead = true;
+        } else {
+          entry.badSince = 0;
         }
+        if (!entry.got && now - entry.born > 20000) {
+          dead = true; // never started
+        }
+        if (dead) {
+          closeCall(id);
+        }
+      }
 
-        // smaller seat number makes the call
-        if (!cur && me < j && peer && peer.open) {
-          var call = peer.call(view.voiceIds[j], localStream);
+      // call everyone with a bigger seat number who is not connected yet
+      for (var peerId in want) {
+        var seat = want[peerId];
+        if (!voiceCalls[peerId] && me < seat) {
+          var call = peer.call(peerId, out);
           if (call) {
-            attachCall(j, call);
+            attachCall(call);
           }
         }
       }
     }
 
     // ----- "who is talking" light -----
-    function watchSpeaking(i, stream) {
-      if (!audioCtx || i < 0 || i > 3) return;
-      unwatchSpeaking(i);
+    function watchSpeaking(key, stream) {
+      initAudio();
+      if (!audioCtx) return;
+      unwatchSpeaking(key);
       try {
         var source = audioCtx.createMediaStreamSource(stream);
         var analyser = audioCtx.createAnalyser();
         analyser.fftSize = 512;
         source.connect(analyser);
-        analysers[i] = { source: source, analyser: analyser, data: new Uint8Array(analyser.fftSize) };
+        analysers[key] = { source: source, analyser: analyser, data: new Uint8Array(analyser.fftSize) };
       } catch (e) { }
     }
 
-    function unwatchSpeaking(i) {
-      var a = analysers[i];
+    function unwatchSpeaking(key) {
+      var a = analysers[key];
       if (a) {
         try { a.source.disconnect(); } catch (e) { }
-        analysers[i] = null;
       }
-      setSpeaking(i, false);
+      delete analysers[key];
     }
 
     function setSpeaking(i, on) {
-      if (speaking[i] == on) return;
+      if (i < 0 || i > 3 || speaking[i] == on) return;
       speaking[i] = on;
       var box = getEl("pbox" + i);
       if (box) {
@@ -2233,8 +2331,10 @@
     }
 
     setInterval(function () {
-      for (var i = 0; i < 4; i++) {
-        var a = analysers[i];
+      if (!lastView) return;
+      var talking = [false, false, false, false];
+      for (var key in analysers) {
+        var a = analysers[key];
         if (!a) continue;
         a.analyser.getByteTimeDomainData(a.data);
         var peak = 0;
@@ -2242,48 +2342,38 @@
           var level = Math.abs(a.data[k] - 128);
           if (level > peak) peak = level;
         }
-        setSpeaking(i, peak > 12);
+        if (peak > 12) {
+          var seat = (key == "me") ? lastView.myIndex : seatOfPeer(key);
+          if (seat >= 0 && !(key == "me" && !micOn)) talking[seat] = true;
+        }
+      }
+      for (var i = 0; i < 4; i++) {
+        setSpeaking(i, talking[i]);
       }
     }, 200);
 
-    // every 5 sec: fix voice calls that broke
+    // every 3 sec: fix voice calls that broke
     setInterval(function () {
       if (lastView) syncVoice(lastView);
-    }, 5000);
+    }, 3000);
 
-    // phone came back: make sure the mic is still alive
+    // phone came back (screen on): wake the sound up again
     document.addEventListener("visibilitychange", function () {
-      if (document.visibilityState != "visible" || !myVoiceOn) return;
-      prepareAudioContext();
-      for (var i = 0; i < 4; i++) {
-        var el = getEl("aud" + i);
-        if (el) el.play().catch(function () { });
-      }
-      var track = localStream && localStream.getAudioTracks()[0];
-      if (track && track.readyState == "ended") {
-        // the phone killed the mic while we were away: get it again
-        navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-          video: false
-        }).then(function (stream) {
-          localStream = stream;
-          stream.getAudioTracks().forEach(function (t) { t.enabled = !myMuted; });
-          if (lastView) watchSpeaking(lastView.myIndex, stream);
-          for (var j = 0; j < 4; j++) {
-            if (voiceCalls[j]) {
-              try { voiceCalls[j].call.close(); } catch (e) { }
-              voiceCalls[j] = null;
-              removeRemote(j);
-            }
-          }
-          if (lastView) syncVoice(lastView);
-        }).catch(function () { });
-      }
+      if (document.visibilityState != "visible") return;
+      unlockAudio();
+      if (lastView) syncVoice(lastView);
     });
 
+    // any tap anywhere: allow sound
+    document.addEventListener("pointerdown", unlockAudio);
+
+    // start the audio engine (silent) as soon as the page loads
+    initAudio();
+
     // ===== Connect the main buttons =====
-    getEl("voiceBtn").onclick = toggleVoice;
-    getEl("voiceBtn2").onclick = toggleVoice;
+    getEl("voiceBtn").onclick = toggleMic;
+    getEl("voiceBtn2").onclick = toggleMic;
+    getEl("audioHint").onclick = unlockAudio;
     getEl("spkBtn").onclick = toggleSpeaker;
     getEl("spkBtn2").onclick = toggleSpeaker;
     updateVoiceButtons();
